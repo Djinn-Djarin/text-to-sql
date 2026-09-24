@@ -1,0 +1,37 @@
+from psycopg_pool import ConnectionPool
+from langchain_postgres import PGVector 
+from langgraph.checkpoint.postgres import PostgresSaver
+from langchain_huggingface import HuggingFaceEmbeddings
+
+from src.agent_traccrop.config import DATABASE_URL
+
+# 1. LangGraph Memory Pool 
+pool = ConnectionPool(
+    conninfo=DATABASE_URL,
+    max_size=20,
+    kwargs={"autocommit": True}
+)
+
+checkpointer = PostgresSaver(pool)
+checkpointer.setup() 
+
+# 2. Vector Store Setup
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2") 
+
+# FIX: LangChain Postgres requires the sqlalchemy psycopg driver format
+# This converts "postgresql://..." to "postgresql+psycopg://..."
+vector_db_url = DATABASE_URL
+if vector_db_url.startswith("postgresql://"):
+    vector_db_url = vector_db_url.replace("postgresql://", "postgresql+psycopg://")
+elif vector_db_url.startswith("postgres://"):
+    vector_db_url = vector_db_url.replace("postgres://", "postgresql+psycopg://")
+
+# FIX: Initialize PGVector using the formatted connection string
+vector_store = PGVector(
+    embeddings=embeddings,
+    collection_name="traccrop_docs",
+    connection=vector_db_url,
+    use_jsonb=True, 
+)
+
+vector_store.create_tables_if_not_exists()
