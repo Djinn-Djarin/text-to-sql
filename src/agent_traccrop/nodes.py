@@ -1,25 +1,92 @@
-from src.agent_traccrop.llm import llm
-from src.agent_traccrop.db import vector_store
+from functools import lru_cache
+from typing import Optional
+
 from langchain_core.messages import SystemMessage
-from src.agent_traccrop.tools import execute_secure_sql
-from src.agent_traccrop.tools import tools
+
+from src.agent_traccrop.llm import llm
+from src.agent_traccrop.config import DATABASE_URL
+from src.agent_traccrop.tools.query_tools import tools
+from src.agent_traccrop.tools.query_tools import validator
+from src.agent_traccrop.tools.schema_discovery import SQLDiscoveryTool
+
+SCHEMA_TABLES: Optional[list[str]] = list(validator.allowed_tables) if validator.allowed_tables else None
+
+
+@lru_cache(maxsize=1)
+def get_database_schema() -> str:
+    """Load the schema once per application process and reuse it for every turn."""
+    discovery = SQLDiscoveryTool(
+        connection_string=DATABASE_URL,
+        schema_name="public",
+        include_tables=SCHEMA_TABLES,
+        sample_rows_in_table_info=0,
+    )
+    return discovery.get_formatted_schema()
+
+
+def refresh_database_schema() -> str:
+    """Clear the cached schema and load it again from PostgreSQL."""
+    get_database_schema.cache_clear()
+    return get_database_schema()
 
 
 # Bind the tools to the Groq model
 llm_with_tools = llm.bind_tools(tools)
 
-def call_model(state, config):
-    """Invokes the LLM with the conversation history and user-specific context."""
-    messages = state["messages"]
 
-    system_prompt = (
-        "You are a helpful agricultural assistant. "
-        "If the user asks about their harvests or farm data, write a PostgreSQL query "
-        "and use the 'query_database' tool to fetch the answer."
-    )
+def call_model(state, config):
+    """Invoke the LLM with the conversation history and database context."""
+    messages = state["messages"]
+    database_schema = get_database_schema()
+
+        # Extract user context from config
+    user_id = config.get("configurable", {}).get("thread_id", "Unknown")
+    user_name = config.get("configurable", {}).get("user_name", "User")
+    account_id = config.get("configurable", {}).get("account_id")
+    
+
+    available_tables = ", ".join(validator.allowed_tables)
+    
+    system_prompt = f"""
+You are a helpful agricultural assistant. You are assisting {user_name} (User ID: {user_id}).
+The user has access to the Account ID: {account_id}
+
+You have access to the following database tables:
+{available_tables}
+
+CRITICAL RULES FOR SQL QUERIES:
+1. You do not know the exact columns for these tables. 
+    - ALWAYS use `get_schema_minimap` first to see a high-level graph of how tables are related.
+    - Then, ALWAYS use `describe_tables` to learn the exact columns and foreign keys of the specific tables you want to query.
+2. ONLY perform read-only SELECT queries.
+3. To ensure data security, you MUST query tables from the `ai_views` schema, not `public` (e.g. `SELECT * FROM ai_views._01_user_management_employeeprofile`).
+   The `ai_views` tables are already pre-filtered for the user's account, so you DO NOT need to add manual `WHERE account_id = ...` filters or join `accountmember` for security. Just query them naturally!
+4. ANTI-LOOP RULE: If a database query returns empty results `[]` after 2 attempts, STOP TRYING. Simply inform the user that the data was not found or they do not have access to it. Do NOT keep retrying different variations.
+""".strip()
 
     full_messages = [SystemMessage(content=system_prompt)] + messages
-
+    # ====== NEW LOGGING CODE ======
+    thread_id = config.get("configurable", {}).get("thread_id", "default")
+    import os
+    os.makedirs("log", exist_ok=True)
+    log_filename = f"log/{thread_id}.txt"
+    with open(log_filename, "a", encoding="utf-8") as log_file:
+        log_file.write("========== NEW LLM CALL ==========\n")
+        for msg in full_messages:
+            log_file.write(f"[{msg.type.upper()}]: {msg.content}\n")
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                log_file.write(f"  Tool Calls: {msg.tool_calls}\n")
+        log_file.write("\n")
+        log_file.flush()
+    # ==============================
     response = llm_with_tools.invoke(full_messages)
+    
+    # Log the AI's response instantly
+    with open(log_filename, "a", encoding="utf-8") as log_file:
+        log_file.write(f"[{response.type.upper()}]: {response.content}\n")
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            log_file.write(f"  Tool Calls: {response.tool_calls}\n")
+        log_file.write("\n")
+        log_file.flush()
 
     return {"messages": [response]}

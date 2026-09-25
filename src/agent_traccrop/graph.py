@@ -1,7 +1,7 @@
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from src.agent_traccrop.tools import tools
+from src.agent_traccrop.tools.query_tools import tools
 from src.agent_traccrop.state import AgentState
 from src.agent_traccrop.nodes import call_model
 from src.agent_traccrop.db import checkpointer
