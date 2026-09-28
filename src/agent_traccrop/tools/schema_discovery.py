@@ -9,7 +9,7 @@ class SQLDiscoveryTool:
         connection_string: str,
         schema_name: Optional[str] = None,
         include_tables: Optional[List[str]] = None,
-        sample_rows_in_table_info: int = 0,
+        sample_rows_in_table_info: int = 3,
     ):
         self.connection_string = self._normalize_connection_string(connection_string)
         self.schema_name = schema_name

@@ -6,6 +6,7 @@ from langchain_core.tools import tool
 from typing import Set, Tuple, Optional
 from langchain_core.runnables import RunnableConfig
 from src.agent_traccrop.tools.schema_discovery import SQLDiscoveryTool
+from src.agent_traccrop.tools.table_metadata import get_table_description
 
 class SQLQueryValidator:
     def __init__(
@@ -95,6 +96,8 @@ TABLE_SECURITY_CONFIG = {
     "_03_crop_customvariety": {"type": "direct"}, # Has account_id natively
     "_07_spraycard_spraycardcropselection": {"type": "join", "target": "_07_spraycard_spraycard", "source_col": "spray_card_id", "target_col": "spray_card_id"},
     "_07_spraycard_spraycardsitetreatment": {"type": "join", "target": "_07_spraycard_spraycard", "source_col": "spray_card_id", "target_col": "spray_card_id"},
+    "_07_spraycard_spraycardchemical": {"type": "join", "target": "_07_spraycard_spraycard", "source_col": "spray_card_id", "target_col": "spray_card_id"},
+    "_07_spraycard_spraycardequipment": {"type": "join", "target": "_07_spraycard_spraycard", "source_col": "spray_card_id", "target_col": "spray_card_id"},
     "_07_spraycard_cropgrowthstage": {"type": "join", "target": "_01_user_management_accountmember", "source_col": "user_id", "target_col": "user_id"},
 }
 
@@ -168,20 +171,59 @@ def query_database(query:str, config:RunnableConfig) -> str:
     return execute_secure_sql(query, user_id, account_id)
 
 
+def get_table_hierarchy_info(table_name: str) -> str:
+    """Extract Parent (outgoing FKs) and Child (incoming FKs) relationships for a table."""
+    parents = []
+    children = []
+    try:
+        with pool.connection() as conn:
+            # Outgoing FKs (Parents)
+            p_cursor = conn.execute('''
+                SELECT kcu.column_name, ccu.table_name, ccu.column_name
+                FROM information_schema.table_constraints AS tc
+                JOIN information_schema.key_column_usage AS kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+                JOIN information_schema.constraint_column_usage AS ccu ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+                WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema='public' AND tc.table_name = %s;
+            ''', (table_name,))
+            for row in p_cursor.fetchall():
+                parents.append(f"  - {row[1]} (via {row[0]} -> {row[2]})")
+
+            # Incoming FKs (Children)
+            c_cursor = conn.execute('''
+                SELECT tc.table_name, kcu.column_name
+                FROM information_schema.table_constraints AS tc
+                JOIN information_schema.key_column_usage AS kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+                JOIN information_schema.constraint_column_usage AS ccu ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+                WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema='public' AND ccu.table_name = %s;
+            ''', (table_name,))
+            for row in c_cursor.fetchall():
+                children.append(f"  - {row[0]} (via {row[1]})")
+    except Exception:
+        pass
+
+    parent_str = "\n".join(parents) if parents else "  - None (Top-level table)"
+    child_str = "\n".join(children) if children else "  - None (Leaf table)"
+
+    return f"PARENTS (Tables this table depends on):\n{parent_str}\n\nCHILDREN (Tables that depend on this table):\n{child_str}"
+
+
 @tool
-def describe_tables(table_names: list[str]) -> str:
-    """Use this tool to get the schema (columns, types, foreign keys) for specific database tables before writing a query."""
+def describe_tables(table_names: list[str] = None, table_name: str = None) -> str:
+    """Use this tool to get table business descriptions, column types, sample rows, and linear parent/child relationships in a single call."""
     
+    if table_names is None:
+        table_names = []
+    if table_name:
+        table_names.append(table_name)
+        
     cleaned_names = []
     for t in table_names:
         try:
             # Parse the string as a SQL Table identifier to robustly extract the raw name
-            # This perfectly handles "public.table", '"public"."table"', or just "table"
             table_ast = sqlglot.parse_one(t, read="postgres", into=exp.Table)
             if table_ast and table_ast.name:
                 cleaned_names.append(table_ast.name.lower())
         except Exception:
-            # If it's completely invalid SQL, just skip it
             pass
 
     valid_tables = [t for t in cleaned_names if t in validator.allowed_tables]
@@ -192,14 +234,23 @@ def describe_tables(table_names: list[str]) -> str:
         connection_string=DATABASE_URL,
         schema_name="public",
         include_tables=valid_tables,
-        sample_rows_in_table_info=0,
+        sample_rows_in_table_info=3,
     )
-    return discovery.get_formatted_schema()
+    raw_schema = discovery.get_formatted_schema()
+
+    output_sections = []
+    for t in valid_tables:
+        desc = get_table_description(t)
+        hierarchy = get_table_hierarchy_info(t)
+        output_sections.append(f"==================================================\nTABLE: {t}\nDESCRIPTION: {desc}\n--------------------------------------------------\n{hierarchy}\n==================================================")
+
+    enhanced_info = "\n\n".join(output_sections)
+    return f"{enhanced_info}\n\nCOLUMNS & SAMPLE ROWS:\n{raw_schema}"
 
 
 @tool
 def get_schema_minimap() -> str:
-    """Use this tool to get a JSON node graph of how the database tables are connected to each other via foreign keys."""
+    """Use this tool to get a JSON node graph of how the database tables are connected to each other via foreign keys, along with table descriptions."""
     try:
         with pool.connection() as conn:
             cursor = conn.execute('''
@@ -219,12 +270,12 @@ def get_schema_minimap() -> str:
             fks = cursor.fetchall()
             
             allowed = validator.allowed_tables
-            connections = {t: [] for t in allowed}
+            connections = {t: {"description": get_table_description(t), "foreign_keys": []} for t in allowed}
             for row in fks:
                 t, ft = row[0], row[1]
                 if t in allowed and ft in allowed:
-                    if ft not in connections[t]:
-                        connections[t].append(ft)
+                    if ft not in connections[t]["foreign_keys"]:
+                        connections[t]["foreign_keys"].append(ft)
             return json.dumps(connections, indent=2)
     except Exception as e:
         return f"Error building minimap: {e}"

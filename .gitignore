@@ -13,3 +13,4 @@ wheels/
 settings.json
 
 log/
+.auth_token

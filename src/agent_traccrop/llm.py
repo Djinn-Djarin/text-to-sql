@@ -1,4 +1,17 @@
-from langchain_groq import ChatGroq
-from src.agent_traccrop.config import GROQ_API_KEY
+import os
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
 
-llm = ChatGroq(api_key=GROQ_API_KEY, model="meta-llama/llama-prompt-guard-2-86m", temperature=0)
+load_dotenv()
+
+# Use ChatOpenAI pointing to Ollama's OpenAI-compatible endpoint.
+# This ensures that tool calling schemas are passed flawlessly to Qwen!
+llm = ChatOpenAI(
+    model=os.getenv("MODEL_NAME"),
+    base_url=f'{os.getenv("OLLAMA_URL", "https://little-drinks-smell.loca.lt").rstrip("/")}/v1',
+    api_key="ollama", # Placeholder, required by the client
+    temperature=0,
+    default_headers={
+        "bypass-tunnel-reminder": "true"
+    }
+)
